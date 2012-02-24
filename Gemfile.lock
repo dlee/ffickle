@@ -1,0 +1,21 @@
+GIT
+  remote: https://github.com/dlee/cast
+  revision: 55294ea8ad5de8bae0db7ae64a258f45bae12ed3
+  specs:
+    cast (0.2.0)
+
+GEM
+  remote: http://rubygems.org/
+  specs:
+    activesupport (3.2.1)
+      i18n (~> 0.6)
+      multi_json (~> 1.0)
+    i18n (0.6.0)
+    multi_json (1.1.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  activesupport
+  cast!
