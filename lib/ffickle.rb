@@ -4,14 +4,26 @@ require 'cast'
 
 module FFIckle
   NAMED_TYPES = [C::Struct, C::Union, C::Enum]
+  CONTAINER_TYPES = [C::Struct, C::Union]
+
+  module Helper
+    def filepath_to_module_name(filepath)
+      File.basename(filepath, '.*').underscore.camelize.gsub('.', '_')
+    end
+  end
 
   class ParseError < ::StandardError; end
 
   class Library
-    attr_reader :files, :typedef_map
+    include Helper
 
-    def initialize(*files)
-      @files = files.flatten.map {|f| File.expand_path f}
+    attr_reader :files, :typedef_map, :module_name,
+      :required_containers, :required_enums
+
+    def initialize(lib, files)
+      @lib = lib
+      @module_name = filepath_to_module_name lib
+      @files = [files].flatten.map {|f| File.expand_path f}
       @parser = C::Parser.new
       @parser.type_names << '__builtin_va_list'
       @preprocessor = C::Preprocessor.new 
@@ -23,7 +35,25 @@ module FFIckle
     end
 
     def to_ffi
-      asts.to_ffi
+      <<-FFI
+require 'ffi'
+#{headers.map(&:to_ffi).join("\n")}
+module #{module_name}
+  extend FFI::Library
+  ffi_lib "#{@lib}"
+
+#{ffi_enums_literal}
+
+#{ffi_containers_literal}
+
+  # load functions from modules
+#{headers.map {|h| "  include #{h.module_name}"}.join("\n")}
+end
+FFI
+    end
+
+    def to_module
+      Object.class_eval to_ffi
     end
 
     def source
@@ -37,8 +67,9 @@ module FFIckle
     def asts
       @asts ||=
         begin
-          @typedef_map = {"__builtin_va_list" => ":varargs"}
+          @typedef_map = {}
           asts = Hash.new {|h,k| h[k] = []}
+          # only look at lines that don't start with #
           source.scan(/(?:^# \d+ "(.+)".*$\n|\n)+(?m:([^#].*?))(?=^#)/) do |file,content|
             begin
               entities = @parser.parse(content).entities.to_a
@@ -63,23 +94,65 @@ module FFIckle
       end
     end
 
-    def rubies
-      files.map {|f| Ruby.new(f, self)}
+    def headers
+      @required_enums = Hash.new {|h,k| h[k] = []}
+      @required_containers = Hash.new {|h,k| h[k] = []}
+      files.map {|f| Header.new(f, self)}
+    end
+
+    private
+    # TODO: make sure to put all dependencies above
+    def ffi_containers_literal
+      return @required_containers.map do |container, functions|
+        functions.uniq.map do |func|
+          "  # required by #{func}()"
+        end.join("\n") + "\n  class #{container.name.camelize} < FFI::#{container.class.to_s.demodulize}
+    layout :a, :int
+  end"
+      end.join("\n")
+      return ''
+      @required_containers.map do |struct, functions|
+        ffi_struct_literal struct, functions
+      end
+    end
+
+    def ffi_struct_literal(struct, functions)
+      layout = []
+      struct.members.each do |declaration|
+        case declaration.type
+        when *NAMED_TYPES
+          declaration.declarators.each do |declarator|
+            layout << declarator.name << ffi_type_literal(declaration.type)
+          end
+        end
+      end
+    end
+
+    def ffi_enums_literal
+      @required_enums.map do |enum, functions|
+        functions.uniq.map do |func|
+          "  # required by #{func}()"
+        end.join("\n") + "\n  #{enum.name.camelize} = enum()"
+      end.join("\n")
     end
   end
 
-  class Ruby
+  class Header
+    include Helper
+
     RUBY_INDENT = 2
-    attr_reader :ruby_name, :class_path, :declarations
+    attr_reader :module_name, :class_path, :declarations
 
     def initialize(header, library)
       @header = header
       @library = library
       @ast = library.asts[header]
-      @ruby_name = @header.sub(/^(?:\/(?:usr|local|lib|include|Library|opt))*\//, '').gsub(/\.\w+$/, '').underscore.camelize
-      @class_path = @ruby_name.split("::")
-      @depth = @class_path.size
-      @inner_indent = indent(@depth)
+      @module_name = filepath_to_module_name header
+
+      # These are shared with @library and across all its headers
+      @required_containers = library.required_containers
+      @required_enums      = library.required_enums
+      @typedef_map         = library.typedef_map
     end
 
     def indent(level)
@@ -87,11 +160,22 @@ module FFIckle
     end
 
     def header
-      @class_path.map.with_index {|n,i| "#{indent(i)}#{(i + 1 == @class_path.length) ? 'class' : 'module'} #{n}\n" }.join
+      <<-HEADER.strip_heredoc
+        module #{@library.module_name}
+          module #{module_name}
+            # from #{@header}
+            def self.included(base)
+              base.module_eval do
+      HEADER
     end
 
     def footer
-      @class_path.map.with_index {|n,i| "#{indent(@depth - i - 1)}end\n"}.join
+      <<-FOOTER.strip_heredoc
+              end
+            end
+          end
+        end
+      FOOTER
     end
 
     def to_ffi
@@ -106,46 +190,75 @@ module FFIckle
         case node
         when C::Declaration
           node.declarators.each do |declarator|
-            indirect_type = declarator.indirect_type
-            case indirect_type
+            type = declarator.type
+            case type
             when C::Function
-              indirect_type.type = node.type unless indirect_type.type # record return type of function
+              type.type = node.type # record return type of function inside the actual function node
               @functions << declarator
             when C::Pointer
-              if indirect_type.type.is_a? C::Function
-                @callbacks << indirect_type.type
+              pointee = type.type
+              if node.typedef? && pointee.is_a?(C::Function)
+                pointee.type = node.type # record return type of function inside the actual function node
+                @callbacks << declarator
               end
             end
           end
+        when C::FunctionDef
+          # TODO
         end
       end
       # gather callbacks, enums, structs, and typedefs the functions rely on
-      @required_callbacks = []
-      @required_enums = []
-      @required_structs = []
-      @required_unions = []
-      @functions.map do |func|
-        name = func.name
-        params = Array(func.type.params).map {|param| ultimate_type(param.type)}
-        return_type = ultimate_type(func.type.type)
-        "#{@inner_indent}attach_function :#{name}, [#{params.join(', ')}], #{return_type}\n"
-      end.join
+      "#{ffi_callbacks_literal}#{ffi_functions_literal}"
     end
 
     private
-    def ultimate_type(type)
+    def ffi_functions_literal
+      @functions.map do |function|
+        "        attach_function :#{function.name}, #{ffi_params_and_return_type function.type}"
+      end.join
+    end
+
+    def ffi_callbacks_literal
+      @callbacks.map do |callback|
+        "        callback :#{callback.name}, #{ffi_params_and_return_type callback.type.type}"
+      end.join
+    end
+
+    def ffi_params_and_return_type(func)
+      params = Array(func.params).map {|param| ffi_type_literal(param.type, func.name)}
+      return_type = ffi_type_literal(func.type, func.name)
+      "[#{params.join(', ')}], #{return_type}\n"
+    end
+
+    # Returns Ruby literal that can be injected as return type or param in Ruby
+    # FFI code.
+    #
+    # If +type+ is a string, it'll look into @library.typedef_map to find what
+    # the type name is mapped to.
+    #
+    # +func_name+ is the name of the function that uses this type in either the
+    # return value or the parameters.
+    #
+    # Also calls +require_type+ on +type+ if the type is a pointer or a named
+    # type.
+    def ffi_type_literal(type, func_name = nil)
       case type
+      when C::CustomType
+        return ":varargs" if type.name == "__builtin_va_list"
+        ffi_type_literal @typedef_map[type.name]
       when C::Pointer
-        # TODO: mark type.type for definition?
         if type =~ 'const char *'
           ":string"
         else
+          require_type type, func_name
           ":pointer"
         end
-      when C::CustomType
-        ultimate_type @library.typedef_map[type.name]
-      when *NAMED_TYPES
+      when *CONTAINER_TYPES
+        require_type type, func_name
         "#{type.name.camelize}.by_value"
+      when C::Enum
+        require_type type, func_name
+        "#{type.name.camelize}"
       when C::PrimitiveType
         name = type.to_s
         name.gsub!(/^(const )?(restrict )?(volatile )?/, ':')
@@ -154,7 +267,56 @@ module FFIckle
         name.gsub!(/ /, '_')
         name
       else
-        type
+        raise "Unknown type: #{type.inspect}"
+      end
+    end
+
+    # Populates +@required_enums+ and +@required_containers+ with top-level
+    # enums, structs, and unions that need to be defined (nested structs and
+    # unions will be automatically defined when the top-level struct/union is
+    # defined).
+    #
+    # Recursively calls +require_type+ on types that are used within structs
+    # and unions. Note, this is only for custom type members of structs/unions,
+    # not nested structs/unions.
+    def require_type(type, func_name)
+      case type
+      when C::Pointer
+        require_type type.type, func_name
+      when C::CustomType
+        require_type @typedef_map[type.name], func_name
+      when *CONTAINER_TYPES
+        require_nested_types type, func_name
+        @required_containers[type] << func_name
+      when C::Enum
+        @required_enums[type] << func_name
+      when C::PrimitiveType
+        # noop
+      else
+        raise "Unknown type: #{type.inspect}"
+      end
+    end
+
+    # Populates +@required_enums+ and +@required_containers+ with top-level
+    # enums, structs, and unions that are referred by +type+.
+    #
+    # This is called recursively for nested structs/unions.
+    def require_nested_types(type, func_name)
+      if type.members
+        type.members.each do |declaration|
+          case declaration.type
+          when C::CustomType
+            require_type(declaration.type, func_name)
+          when C::Struct, C::Union
+            if declaration.type.members
+              # nested struct/union
+              require_nested_types(declaration.type, func_name)
+            else
+              # reference to top-level struct/union
+              require_type(declaration.type, func_name)
+            end
+          end
+        end
       end
     end
   end

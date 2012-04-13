@@ -1,1 +1,22 @@
-Ruby FFI generator
+FFIckle - Ruby FFI generator
+
+Can't decide if you're using Ruby or C? FFIckle.
+
+FFIckle takes your C headers and turns them into FFI Ruby code so you don't
+have to translate C into FFI yourself.
+
+Example:
+    require 'ffickle'
+    lib = FFIckle::Library.new('libgphoto2',
+                               '/usr/local/include/gphoto2/gphoto2-version.h')
+    ffi = lib.to_ffi
+    puts ffi
+    eval ffi
+
+    pointer = Libgphoto2.gp_library_version 1
+    puts pointer.read_pointer.read_string
+
+TODO:
+* Add enum, struct, union
+* Support for arrays
+* Add tests
