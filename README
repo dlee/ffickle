@@ -1,6 +1,6 @@
 FFIckle - Ruby FFI generator
 
-Can't decide if you're using Ruby or C? FFIckle.
+Want to C libraries in Ruby? That's FFIckle.
 
 FFIckle takes your C headers and turns them into FFI Ruby code so you don't
 have to translate C into FFI yourself.
