@@ -7,6 +7,8 @@ module FFIckle
   CONTAINER_TYPES = [C::Struct, C::Union]
 
   module Helper
+    attr_reader :typedef_map, :required_containers, :required_enums
+
     def filepath_to_module_name(filepath)
       File.basename(filepath, '.*').underscore.camelize.gsub('.', '_')
     end
@@ -17,8 +19,7 @@ module FFIckle
   class Library
     include Helper
 
-    attr_reader :files, :typedef_map, :module_name,
-      :required_containers, :required_enums
+    attr_reader :files, :module_name
 
     def initialize(lib, files)
       @lib = lib
@@ -130,9 +131,16 @@ FFI
 
     def ffi_enums_literal
       @required_enums.map do |enum, functions|
+        literal = enum.members.map do |member|
+          if member.val
+            "    :#{member.name}, #{member.val.val}"
+          else
+            "    :#{member.name}"
+          end
+        end.join(",\n")
         functions.uniq.map do |func|
           "  # required by #{func}()"
-        end.join("\n") + "\n  #{enum.name.camelize} = enum()"
+        end.join("\n") + "\n  #{enum.name.camelize} = enum(\n#{literal}\n  )"
       end.join("\n")
     end
   end
