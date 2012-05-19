@@ -12,6 +12,97 @@ module FFIckle
     def filepath_to_module_name(filepath)
       File.basename(filepath, '.*').underscore.camelize.gsub('.', '_')
     end
+
+    # Returns Ruby literal that can be injected as return type or param in Ruby
+    # FFI code.
+    #
+    # If +type+ is a string, it'll look into @library.typedef_map to find what
+    # the type name is mapped to.
+    #
+    # +func_name+ is the name of the function that uses this type in either the
+    # return value or the parameters.
+    #
+    # Also calls +require_type+ on +type+ if the type is a pointer or a named
+    # type.
+    def ffi_type_literal(type, func_name = nil)
+      case type
+      when C::CustomType
+        return ":varargs" if type.name == "__builtin_va_list"
+        ffi_type_literal @typedef_map[type.name], func_name
+      when C::Pointer
+        if type =~ 'const char *'
+          ":string"
+        else
+          require_type type, func_name
+          ":pointer"
+        end
+      when *CONTAINER_TYPES
+        require_type type, func_name
+        "#{type.name.camelize}.by_value"
+      when C::Enum
+        require_type type, func_name
+        "#{type.name.camelize}"
+      when C::PrimitiveType
+        name = type.to_s
+        name.gsub!(/^(const )?(restrict )?(volatile )?/, ':')
+        name.gsub!(/unsigned /, 'u')
+        name.gsub!(/ int$/, '')
+        name.gsub!(/ /, '_')
+        name
+      else
+        raise "Unknown type: #{type.inspect}"
+      end
+    end
+
+    # Populates keys of +@required_enums+ and +@required_containers+ with
+    # top-level enums, structs, and unions that need to be defined (nested
+    # structs and unions will be automatically defined when the top-level
+    # struct/union is defined). The keys map to an array of function names that
+    # refer to the types.
+    #
+    # Recursively calls +require_type+ on types that are used within structs
+    # and unions. Note, this is only for custom type members of structs/unions,
+    # not nested structs/unions.
+    def require_type(type, func_name)
+      case type
+      when C::Pointer
+        require_type type.type, func_name
+      when C::CustomType
+        require_type @typedef_map[type.name], func_name
+      when *CONTAINER_TYPES
+        require_nested_types type, func_name
+        @required_containers[type] << func_name
+      when C::Enum
+        @required_enums[type] << func_name
+      when C::PrimitiveType
+        # noop
+      else
+        raise "Unknown type: #{type.inspect}"
+      end
+    end
+
+    # Populates +@required_enums+ and +@required_containers+ with top-level
+    # enums, structs, and unions that are referred by +type+.
+    #
+    # This is called recursively for nested structs/unions.
+    def require_nested_types(type, func_name)
+      if type.members
+        type.members.each do |declaration|
+          case declaration.type
+          when C::CustomType
+            require_type(declaration.type, func_name)
+          when C::Struct, C::Union
+            if declaration.type.members
+              # nested struct/union
+              require_nested_types(declaration.type, func_name)
+            else
+              # reference to top-level struct/union
+              require_type(declaration.type, func_name)
+            end
+          end
+        end
+      end
+    end
   end
 
   class ParseError < ::StandardError; end
@@ -102,35 +193,28 @@ FFI
     end
 
     private
-    # TODO: make sure to put all dependencies above
     def ffi_containers_literal
+      # TODO: make sure to put definitions of nested types before each container definition
       return @required_containers.map do |container, functions|
-        functions.uniq.map do |func|
+        referring_functions = functions.uniq.map do |func|
           "  # required by #{func}()"
-        end.join("\n") + "\n  class #{container.name.camelize} < FFI::#{container.class.to_s.demodulize}
-    layout :a, :int
-  end"
-      end.join("\n")
-      return ''
-      @required_containers.map do |struct, functions|
-        ffi_struct_literal struct, functions
-      end
-    end
+        end.join("\n")
 
-    def ffi_struct_literal(struct, functions)
-      layout = []
-      struct.members.each do |declaration|
-        case declaration.type
-        when *NAMED_TYPES
-          declaration.declarators.each do |declarator|
-            layout << declarator.name << ffi_type_literal(declaration.type)
-          end
+        # TODO: handle nested struct/unions
+        if container.members
+          layout = "    layout(\n" << container.members.map do |member|
+            "      :#{member.declarators.first.name}, #{ffi_type_literal member.type, "parent #{container.class.to_s.demodulize}"}"
+          end.join(",\n") << "\n    )"
+        else
+          layout = "    # empty struct"
         end
-      end
+
+        "#{referring_functions}\n  class #{container.name.camelize} < FFI::#{container.class.to_s.demodulize}\n#{layout}\n  end"
+      end.join("\n")
     end
 
     def ffi_enums_literal
-      @required_enums.map do |enum, functions|
+      @required_enums.map do |enum, function_names|
         literal = enum.members.map do |member|
           if member.val
             "    :#{member.name}, #{member.val.val}"
@@ -138,8 +222,8 @@ FFI
             "    :#{member.name}"
           end
         end.join(",\n")
-        functions.uniq.map do |func|
-          "  # required by #{func}()"
+        function_names.uniq.map do |function_name|
+          "  # required by #{function_name}()"
         end.join("\n") + "\n  #{enum.name.camelize} = enum(\n#{literal}\n  )"
       end.join("\n")
     end
@@ -222,110 +306,22 @@ FFI
     private
     def ffi_functions_literal
       @functions.map do |function|
-        "        attach_function :#{function.name}, #{ffi_params_and_return_type function.type}"
+        "        attach_function :#{function.name}, #{ffi_params_and_return_type function.name, function.type}"
       end.join
     end
 
     def ffi_callbacks_literal
       @callbacks.map do |callback|
-        "        callback :#{callback.name}, #{ffi_params_and_return_type callback.type.type}"
+        "        callback :#{callback.name}, #{ffi_params_and_return_type callback.name, callback.type.type}"
       end.join
     end
 
-    def ffi_params_and_return_type(func)
-      params = Array(func.params).map {|param| ffi_type_literal(param.type, func.name)}
-      return_type = ffi_type_literal(func.type, func.name)
+    # function_name is required only so that named types referred to by
+    # function can know which function referred to them.
+    def ffi_params_and_return_type(function_name, function_type)
+      params = Array(function_type.params).map {|param| ffi_type_literal(param.type, function_name)}
+      return_type = ffi_type_literal(function_type.type, function_name)
       "[#{params.join(', ')}], #{return_type}\n"
-    end
-
-    # Returns Ruby literal that can be injected as return type or param in Ruby
-    # FFI code.
-    #
-    # If +type+ is a string, it'll look into @library.typedef_map to find what
-    # the type name is mapped to.
-    #
-    # +func_name+ is the name of the function that uses this type in either the
-    # return value or the parameters.
-    #
-    # Also calls +require_type+ on +type+ if the type is a pointer or a named
-    # type.
-    def ffi_type_literal(type, func_name = nil)
-      case type
-      when C::CustomType
-        return ":varargs" if type.name == "__builtin_va_list"
-        ffi_type_literal @typedef_map[type.name]
-      when C::Pointer
-        if type =~ 'const char *'
-          ":string"
-        else
-          require_type type, func_name
-          ":pointer"
-        end
-      when *CONTAINER_TYPES
-        require_type type, func_name
-        "#{type.name.camelize}.by_value"
-      when C::Enum
-        require_type type, func_name
-        "#{type.name.camelize}"
-      when C::PrimitiveType
-        name = type.to_s
-        name.gsub!(/^(const )?(restrict )?(volatile )?/, ':')
-        name.gsub!(/unsigned /, 'u')
-        name.gsub!(/ int$/, '')
-        name.gsub!(/ /, '_')
-        name
-      else
-        raise "Unknown type: #{type.inspect}"
-      end
-    end
-
-    # Populates +@required_enums+ and +@required_containers+ with top-level
-    # enums, structs, and unions that need to be defined (nested structs and
-    # unions will be automatically defined when the top-level struct/union is
-    # defined).
-    #
-    # Recursively calls +require_type+ on types that are used within structs
-    # and unions. Note, this is only for custom type members of structs/unions,
-    # not nested structs/unions.
-    def require_type(type, func_name)
-      case type
-      when C::Pointer
-        require_type type.type, func_name
-      when C::CustomType
-        require_type @typedef_map[type.name], func_name
-      when *CONTAINER_TYPES
-        require_nested_types type, func_name
-        @required_containers[type] << func_name
-      when C::Enum
-        @required_enums[type] << func_name
-      when C::PrimitiveType
-        # noop
-      else
-        raise "Unknown type: #{type.inspect}"
-      end
-    end
-
-    # Populates +@required_enums+ and +@required_containers+ with top-level
-    # enums, structs, and unions that are referred by +type+.
-    #
-    # This is called recursively for nested structs/unions.
-    def require_nested_types(type, func_name)
-      if type.members
-        type.members.each do |declaration|
-          case declaration.type
-          when C::CustomType
-            require_type(declaration.type, func_name)
-          when C::Struct, C::Union
-            if declaration.type.members
-              # nested struct/union
-              require_nested_types(declaration.type, func_name)
-            else
-              # reference to top-level struct/union
-              require_type(declaration.type, func_name)
-            end
-          end
-        end
-      end
     end
   end
 end
